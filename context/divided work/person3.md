@@ -1,0 +1,12 @@
+Person 3 — AWS + Deployment
+- Custom VPC & networking
+- EC2 setup
+- RDS setup
+- S3 document storage
+- Textract integration
+- SES email
+- IAM & Security Groups
+- SSM Parameter Store
+- Docker + Nginx deployment
+- CloudWatch monitoring
+- AWS Budget
