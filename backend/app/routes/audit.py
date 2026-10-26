@@ -4,8 +4,13 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.kyc import AuditLog
 from app.schemas.kyc import AuditEventResponse
+from app.security import require_admin
 
-router = APIRouter(prefix="/audit", tags=["Audit Trail"])
+router = APIRouter(
+    prefix="/audit",
+    tags=["Audit Trail"],
+    dependencies=[Depends(require_admin)],
+)
 
 
 @router.get("/logs", response_model=List[AuditEventResponse])

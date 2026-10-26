@@ -1,4 +1,4 @@
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 from app.main import app
 from app.database.connection import check_db_connection
@@ -42,25 +42,9 @@ def test_health_endpoint_when_db_offline():
         assert "Database unreachable" in data["database_message"]
 
 
-def test_auth_login():
-    mock_db = MagicMock()
-    mock_user = MagicMock()
-    mock_user.role = "customer"
-    mock_user.full_name = "Anaya Rao"
-    mock_user.user_id = "CUS-1042"
-    mock_user.email = "anaya.rao@example.test"
-    mock_db.query.return_value.filter.return_value.first.return_value = mock_user
-
-    from app.database import get_db
-    app.dependency_overrides[get_db] = lambda: mock_db
-    try:
-        response = client.post("/auth/login", json={"role": "customer"})
-        assert response.status_code == 200
-        data = response.json()
-        assert data["role"] == "customer"
-        assert data["userId"] == "CUS-1042"
-    finally:
-        app.dependency_overrides.clear()
+def test_auth_login_requires_credentials():
+    response = client.post("/auth/login", json={"role": "customer"})
+    assert response.status_code == 422
 
 
 def test_check_db_connection_success():

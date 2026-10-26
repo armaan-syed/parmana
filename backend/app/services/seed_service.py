@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
-from app.models.kyc import User, Customer, KycRequest, AuditLog
+from app.models.kyc import Customer, KycRequest, AuditLog
 
 
 def seed_initial_data(db: Session):
@@ -10,18 +10,6 @@ def seed_initial_data(db: Session):
     """
     if db.query(Customer).first() is not None:
         return
-
-    # Seed Users
-    users_data = [
-        User(user_id="CUS-1042", email="anaya.rao@example.test", full_name="Anaya Rao", role="customer"),
-        User(user_id="CUS-1038", email="kabir.mehta@example.test", full_name="Kabir Mehta", role="customer"),
-        User(user_id="CUS-1031", email="meera.iyer@example.test", full_name="Meera Iyer", role="customer"),
-        User(user_id="CUS-1024", email="rohan.das@example.test", full_name="Rohan Das", role="customer"),
-        User(user_id="CUS-1016", email="tara.shah@example.test", full_name="Tara Shah", role="customer"),
-        User(user_id="ADM-001", email="admin@pramana.test", full_name="Nisha Verma", role="admin"),
-    ]
-    db.add_all(users_data)
-    db.commit()
 
     # Seed Customers
     customers_data = [

@@ -16,6 +16,17 @@ dist-ssr
 .nitro
 *.local
 
+# Local frontend environment files (secrets never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+
 # Wrangler / Cloudflare
 .wrangler/
 .dev.vars

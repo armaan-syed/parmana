@@ -99,3 +99,14 @@ def check_db_connection() -> dict:
             "connected": False,
             "message": f"Database unreachable: {str(exc)}",
         }
+
+
+def ensure_user_email_index(engine: Engine) -> None:
+    """Adds the case-insensitive unique email constraint without replacing data."""
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email_lower "
+                "ON users (lower(email))"
+            )
+        )

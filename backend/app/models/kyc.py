@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from typing import Optional, List
-from sqlalchemy import String, Integer, DateTime, ForeignKey, Text, JSON, Float
+from sqlalchemy import String, Integer, DateTime, ForeignKey, Text, JSON, Float, Index, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database.base import Base
 
@@ -14,6 +14,7 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True, autoincrement=True)
     user_id: Mapped[str] = mapped_column(String(50), unique=True, index=True)  # e.g. "CUS-1042" or "ADM-001"
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    __table_args__ = (Index("uq_users_email_lower", func.lower(email), unique=True),)
     full_name: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(20), default="customer")  # "customer" or "admin"
     password_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)

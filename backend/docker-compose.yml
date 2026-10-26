@@ -25,6 +25,8 @@ services:
       dockerfile: Dockerfile
     container_name: pramana-backend
     restart: always
+    env_file:
+      - .env
     ports:
       - "8000:8000"
     environment:

@@ -4,6 +4,9 @@ Reads environment variables or a local .env file safely without hardcoded secret
 """
 
 from functools import lru_cache
+from pathlib import Path
+
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,7 +28,7 @@ class Settings(BaseSettings):
     # Security configuration
     SECRET_KEY: str = "insecure_dev_secret_key_change_in_env_file"
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=60, ge=1, le=1440)
 
     # AWS Configuration placeholders (coordinated with Person 3)
     AWS_REGION: str = "ap-south-1"
@@ -37,7 +40,7 @@ class Settings(BaseSettings):
     SIMILARITY_THRESHOLD_ADDRESS: float = 80.0
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=Path(__file__).resolve().parents[1] / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )

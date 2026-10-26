@@ -6,7 +6,13 @@ Backend entry point (Person 1)
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
-from app.database import Base, get_engine, check_db_connection, get_db
+from app.database import (
+    Base,
+    get_engine,
+    check_db_connection,
+    ensure_user_email_index,
+    get_db,
+)
 from app.services.seed_service import seed_initial_data
 from app.routes import (
     auth_router,
@@ -26,11 +32,11 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-# CORS configuration to allow local Next.js / TanStack / Vite frontend communication
+# Bearer auth does not use ambient cookies, so cross-origin credentials stay disabled.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -52,6 +58,7 @@ def init_db():
     if status.get("connected"):
         engine = get_engine()
         Base.metadata.create_all(bind=engine)
+        ensure_user_email_index(engine)
         db = next(get_db())
         try:
             seed_initial_data(db)

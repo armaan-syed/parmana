@@ -7,12 +7,12 @@ export const Route = createFileRoute("/login")({
       { title: "Sign in — Pramāṇa" },
       {
         name: "description",
-        content: "Sign in to your Pramāṇa demo workspace as a customer or admin reviewer.",
+        content: "Sign in or create a secure Pramāṇa account.",
       },
       { property: "og:title", content: "Sign in — Pramāṇa" },
       {
         property: "og:description",
-        content: "Sign in to your Pramāṇa demo workspace as a customer or admin reviewer.",
+        content: "Sign in or create a secure Pramāṇa account.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary" },

@@ -25,18 +25,23 @@ If you don't have PostgreSQL installed on your computer, Docker can run both Pos
    ```powershell
    cd "c:\laptop backup\Documents\Aradhya\SEM5\CCL\Mini Project\Pramana\backend"
    ```
-3. **Launch with Docker Compose**:
+3. **Configure the backend environment**:
+   ```powershell
+   Copy-Item .env.example .env
+   ```
+   Set `SECRET_KEY` in `.env` to a private random value (see the command below). Never commit `.env`.
+4. **Launch with Docker Compose**:
    ```powershell
    docker compose up -d --build
    ```
-4. **Verify it's running**:
+5. **Verify it's running**:
    ```powershell
    docker compose ps
    ```
    You will see:
    - `pramana-postgres` running on port `5432`
    - `pramana-backend` running on port `8000`
-5. **Shut down when done**:
+6. **Shut down when done**:
    ```powershell
    docker compose down
    ```
@@ -103,7 +108,7 @@ If you want live reload while coding:
    - **Password**: `postgrespassword` (or your local password if using Option C)
 4. Click **Test Connection** (Accept prompt to download driver if prompted) → Click **Finish**.
 5. Browse tables under `pramana_db` → `Schemas` → `public` → `Tables`:
-   - `users`: Contains seed logins for Customer (`CUS-1042`) and Admin (`ADM-001`).
+   - `users`: Registered customer accounts and explicitly provisioned administrators. Passwords are stored as hashes.
    - `customers`: Customer baseline records.
    - `kyc_requests`: KYC submission requests with match statuses.
    - `documents`: Document upload metadata.
@@ -121,18 +126,17 @@ You can test every endpoint directly:
 
 1. **`GET /health`**
    - Returns application status and tests whether PostgreSQL is connected.
-2. **`POST /auth/login`**
-   - Request Body:
-     ```json
-     { "role": "customer" }
-     ```
-     or
-     ```json
-     { "role": "admin" }
-     ```
-3. **`GET /admin/requests`**
+2. **`POST /auth/register`**
+   - Request body: `{"fullName":"Example Customer","email":"customer@example.com","password":"A-long-password-123","confirmPassword":"A-long-password-123"}`
+   - Registration always assigns the `customer` role; a supplied role is ignored.
+3. **`POST /auth/login`**
+   - Request body: `{"email":"customer@example.com","password":"A-long-password-123"}`
+   - Copy the returned token into Swagger's **Authorize** dialog as a Bearer token.
+4. **`GET /auth/me`**
+   - Validates the token and returns the authenticated database identity.
+5. **`GET /admin/requests`**
    - Returns all queued KYC cases (`KYC-2841`, `KYC-2838`, etc.).
-4. **`POST /admin/requests/{request_id}/update-and-process`**
+6. **`POST /admin/requests/{request_id}/update-and-process`**
    - Resolves a mismatch and automatically writes to `audit_logs`.
    - Body:
      ```json
@@ -143,17 +147,36 @@ You can test every endpoint directly:
        "adminName": "Nisha Verma"
      }
      ```
-5. **`GET /audit/logs`**
+7. **`GET /audit/logs`**
    - Returns the complete tamper-evident audit history.
+
+### Provision an administrator
+
+There is no public administrator registration. With the backend virtual environment activated and `backend/.env` configured, run:
+
+```powershell
+python -m app.cli create-admin
+```
+
+The command prompts for the administrator's name, email, and password without echoing the password. It refuses to overwrite an existing account.
+
+Set `SECRET_KEY` in `backend/.env` to a unique random value of at least 32 characters. For example:
+
+```powershell
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Tokens are signed JWT bearer tokens with an expiry controlled by `ACCESS_TOKEN_EXPIRE_MINUTES` (default 60 minutes). Passwords use pwdlib's recommended Argon2id hashing scheme. The frontend keeps the token in tab-scoped `sessionStorage`, never `localStorage`.
 
 ---
 
 ## 5. Connecting Frontend (Person 2) to Backend
 
-Currently, the frontend in `Pramana/src/components/pramana/demo-state.tsx` uses mock state. To connect with this backend:
+Configure the frontend to use the FastAPI service:
 - Add `VITE_API_BASE_URL=http://localhost:8000` to `Pramana/.env`.
-- In `demo-state.tsx`, replace the in-memory array operations with `fetch()` calls to the corresponding routes above.
-- The request/response payloads in `app/schemas/kyc.py` were written to mirror the frontend types (`id`, `customerId`, `name`, `status`, `fields`, `audit`, etc.) for zero friction.
+- Set `VITE_API_BASE_URL=http://localhost:8000` in the frontend environment.
+- Sign up using the **Create Account** form, then sign in with the new credentials.
+- Customer and administrator APIs verify the bearer token against the database; customer identifiers in request bodies or query parameters do not override the authenticated identity.
 
 ---
 

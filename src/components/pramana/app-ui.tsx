@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
   ArrowDown,
@@ -57,13 +58,23 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { useDemo } from "@/components/pramana/demo-state";
 import {
-  useDemo,
-  type DemoRequest,
-  type KycStatus,
-  type MatchStatus,
-  type Role,
-} from "@/components/pramana/demo-state";
+  useAdminRequest,
+  useAdminRequests,
+  useAuditLogs,
+  useCustomerList,
+  useCustomerProfile,
+  useCustomerStatus,
+  isNotFound,
+  useProcessRequest,
+  useRejectRequest,
+  useSubmitDocuments,
+  useUpdateAndProcessRequest,
+} from "@/hooks/pramana-queries";
+import type { KycRequestSummary } from "@/lib/pramana-api";
+import { ApiError, apiErrorMessage, register as apiRegister } from "@/lib/pramana-api";
+import { initials, maskEmail, maskPhone } from "@/lib/session";
 
 type PageKey =
   | "landing"
@@ -111,7 +122,7 @@ function Brand({ inverse = false }: { inverse?: boolean }) {
   );
 }
 
-function StatusBadge({ status }: { status: KycStatus | string }) {
+function StatusBadge({ status }: { status: string }) {
   const normalized = status.replaceAll("_", " ");
   const tone =
     status === "VERIFIED"
@@ -138,7 +149,7 @@ function StatusBadge({ status }: { status: KycStatus | string }) {
 }
 
 function DemoBanner({
-  children = "Demo workspace · All records and actions are simulated",
+  children = "Connected to the Pramāṇa API · Secure account authentication",
 }: {
   children?: string;
 }) {
@@ -212,17 +223,28 @@ function PageHeading({
 }
 
 function AppShell({ children, area }: { children: ReactNode; area: "customer" | "admin" }) {
-  const { logout, reset, role } = useDemo();
+  const { logout, name: sessionName, role, session } = useDemo();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [open, setOpen] = useState(false);
   const menu = appLinks[area];
-  const userName = role === "admin" ? "Nisha Verma" : "Anaya Rao";
+  const userName = sessionName ?? (role === "admin" ? "Admin reviewer" : "Customer");
   const userSubtitle = role === "admin" ? "Compliance reviewer" : "Customer account";
   const path = useRouterState({ select: (state) => state.location.pathname });
   const signout = () => {
-    logout();
-    toast.success("Signed out of the demo workspace.");
+    // Clears the session and all user-specific cached server data.
+    queryClient.clear();
+    try {
+      logout();
+      toast.success("Signed out.");
+    } catch {
+      toast.error("Signed out in this tab, but browser storage could not be cleared.");
+    }
     void navigate({ to: "/login" });
+  };
+  const refresh = () => {
+    void queryClient.invalidateQueries();
+    toast.success("Refreshing workspace data from the API…");
   };
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -272,7 +294,7 @@ function AppShell({ children, area }: { children: ReactNode; area: "customer" | 
             }
           >
             <span className="grid size-9 place-items-center rounded-full bg-sidebar-accent text-sm font-semibold">
-              {area === "admin" ? "NV" : "AR"}
+              {initials(session?.name, area === "admin" ? "AD" : "CU")}
             </span>
             <span className="min-w-0 flex-1">
               <span className="block truncate text-xs font-semibold">{userName}</span>
@@ -286,14 +308,10 @@ function AppShell({ children, area }: { children: ReactNode; area: "customer" | 
             variant="ghost"
             size="sm"
             className="mt-2 w-full justify-start text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground"
-            onClick={() => {
-              reset();
-              toast.success("Demo data restored to its initial state.");
-              void navigate({ to: "/login" });
-            }}
+            onClick={refresh}
           >
             <RefreshCw size={15} />
-            Reset demo data
+            Refresh data
           </Button>
         </div>
       </aside>
@@ -348,7 +366,7 @@ function AppShell({ children, area }: { children: ReactNode; area: "customer" | 
         <main className="mx-auto w-full max-w-[1440px] px-4 py-6 sm:px-7 sm:py-8">
           {children}
           <footer className="mt-10 border-t border-border py-4 text-xs text-muted-foreground">
-            Pramāṇa · A frontend demonstration. Verification outcomes shown here are simulated.
+            Pramāṇa · Connected to the Pramāṇa API. Verification outcomes come from the backend.
           </footer>
         </main>
       </div>
@@ -537,29 +555,89 @@ function LandingPage() {
 }
 
 function LoginPage() {
-  const { login } = useDemo();
+  const { login, role: activeRole, sessionError } = useDemo();
   const navigate = useNavigate();
+  const [mode, setMode] = useState<"signin" | "create">("signin");
+  const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
   const [show, setShow] = useState(false);
   const [busy, setBusy] = useState(false);
-  const enter = (role: Role) => {
-    login(role);
-    void navigate({ to: role === "admin" ? "/admin/dashboard" : "/customer/dashboard" });
-  };
-  const submit = (event: React.FormEvent<HTMLFormElement>) => {
+
+  // If a session already exists, jump straight into the matching workspace.
+  useEffect(() => {
+    if (activeRole) {
+      void navigate({ to: activeRole === "admin" ? "/admin/dashboard" : "/customer/dashboard" });
+    }
+  }, [activeRole, navigate]);
+  useEffect(() => {
+    if (sessionError) setError(sessionError);
+  }, [sessionError]);
+
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!email.trim() || !password) {
-      setError("Enter an email and password to continue.");
+    setError("");
+    setSuccess("");
+
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+      setError("Enter a valid email address.");
       return;
     }
+    if (mode === "create") {
+      if (!fullName.trim()) {
+        setError("Enter your full name.");
+        return;
+      }
+      if (password.length < 6 || !/[A-Za-z]/.test(password) || !/\d/.test(password)) {
+        setError("Use at least 6 characters, including at least one letter and one number.");
+        return;
+      }
+      if (password !== confirmPassword) {
+        setError("Passwords do not match.");
+        return;
+      }
+    } else if (!password) {
+      setError("Enter your password to continue.");
+      return;
+    }
+
     setBusy(true);
-    setError("");
-    window.setTimeout(() => {
+    try {
+      if (mode === "create") {
+        const result = await apiRegister({
+          fullName: fullName.trim(),
+          email: normalizedEmail,
+          password,
+          confirmPassword,
+        });
+        setMode("signin");
+        setPassword("");
+        setConfirmPassword("");
+        setSuccess(result.message);
+      } else {
+        const result = await login({ email: normalizedEmail, password });
+        void navigate({
+          to: result.role === "admin" ? "/admin/dashboard" : "/customer/dashboard",
+        });
+      }
+    } catch (err) {
+      setError(
+        apiErrorMessage(
+          err instanceof ApiError ? err.detail : null,
+          err instanceof Error
+            ? err.message
+            : mode === "create"
+              ? "Account creation failed. Please try again."
+              : "Sign-in failed. Please try again.",
+        ),
+      );
+    } finally {
       setBusy(false);
-      setError("Demo sign-in uses the role buttons below. Use a demo role to continue.");
-    }, 650);
+    }
   };
   return (
     <div className="grid min-h-screen bg-background lg:grid-cols-[1.05fr_.95fr]">
@@ -570,13 +648,13 @@ function LoginPage() {
         <div className="max-w-lg">
           <span className="mb-5 inline-flex items-center gap-2 text-xs font-medium text-primary-foreground/70">
             <ShieldCheck size={15} />
-            DEMO WORKSPACE
+            SECURE WORKSPACE
           </span>
           <h1 className="text-4xl font-semibold leading-tight">
             A considered approach to identity verification.
           </h1>
           <p className="mt-4 max-w-md text-sm leading-6 text-primary-foreground/75">
-            A frontend-only demonstration of document submission and human-led review.
+            Sign in to your account to manage identity verification securely.
           </p>
           <div className="mt-10 grid grid-cols-2 gap-3">
             <div className="rounded-md border border-primary-foreground/15 bg-primary-foreground/5 p-4">
@@ -591,7 +669,7 @@ function LoginPage() {
             </div>
           </div>
         </div>
-        <p className="text-xs text-primary-foreground/60">Pramāṇa · Simulated demo environment</p>
+        <p className="text-xs text-primary-foreground/60">Pramāṇa · Secure identity workspace</p>
       </section>
       <section className="flex flex-col items-center justify-center px-5 py-10">
         <div className="w-full max-w-[420px]">
@@ -603,9 +681,61 @@ function LoginPage() {
           <span className="grid size-12 place-items-center rounded-lg bg-accent text-primary">
             <LockKeyhole size={21} />
           </span>
-          <h2 className="mt-6 text-2xl font-semibold tracking-tight">Welcome back</h2>
-          <p className="mt-2 text-sm text-muted-foreground">Sign in to your Pramāṇa workspace.</p>
+          <div
+            className="mt-6 grid grid-cols-2 rounded-md bg-muted p-1"
+            role="tablist"
+            aria-label="Account access"
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === "signin"}
+              className={`rounded px-3 py-2 text-sm font-medium ${mode === "signin" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}
+              onClick={() => {
+                setMode("signin");
+                setError("");
+                setSuccess("");
+              }}
+            >
+              Sign In
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === "create"}
+              className={`rounded px-3 py-2 text-sm font-medium ${mode === "create" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"}`}
+              onClick={() => {
+                setMode("create");
+                setError("");
+                setSuccess("");
+              }}
+            >
+              Create Account
+            </button>
+          </div>
+          <h2 className="mt-6 text-2xl font-semibold tracking-tight">
+            {mode === "signin" ? "Welcome back" : "Create your account"}
+          </h2>
+          <p className="mt-2 text-sm text-muted-foreground">
+            {mode === "signin"
+              ? "Sign in to your Pramāṇa workspace."
+              : "Create a secure customer account to get started."}
+          </p>
           <form className="mt-7 space-y-4" onSubmit={submit}>
+            {mode === "create" && (
+              <label className="block text-sm font-medium">
+                Full name
+                <Input
+                  className="mt-2 h-11 bg-card"
+                  value={fullName}
+                  onChange={(event) => setFullName(event.target.value)}
+                  autoComplete="name"
+                  placeholder="Your full name"
+                  aria-label="Full name"
+                  required
+                />
+              </label>
+            )}
             <label className="block text-sm font-medium">
               Email address
               <Input
@@ -613,8 +743,10 @@ function LoginPage() {
                 type="email"
                 value={email}
                 onChange={(event) => setEmail(event.target.value)}
+                autoComplete="email"
                 placeholder="you@example.com"
                 aria-label="Email address"
+                required
               />
             </label>
             <label className="block text-sm font-medium">
@@ -625,8 +757,10 @@ function LoginPage() {
                   type={show ? "text" : "password"}
                   value={password}
                   onChange={(event) => setPassword(event.target.value)}
-                  placeholder="Enter your password"
+                  autoComplete={mode === "create" ? "new-password" : "current-password"}
+                  placeholder={mode === "create" ? "At least 6 characters" : "Enter your password"}
                   aria-label="Password"
+                  required
                 />
                 <button
                   type="button"
@@ -637,6 +771,31 @@ function LoginPage() {
                 </button>
               </span>
             </label>
+            {mode === "create" && (
+              <>
+                <p className="-mt-2 text-xs text-muted-foreground">
+                  Use 12 or more characters with at least one letter and one number.
+                </p>
+                <label className="block text-sm font-medium">
+                  Confirm password
+                  <Input
+                    className="mt-2 h-11 bg-card"
+                    type={show ? "text" : "password"}
+                    value={confirmPassword}
+                    onChange={(event) => setConfirmPassword(event.target.value)}
+                    autoComplete="new-password"
+                    placeholder="Re-enter your password"
+                    aria-label="Confirm password"
+                    required
+                  />
+                </label>
+              </>
+            )}
+            {success && (
+              <p role="status" className="rounded-md bg-success/10 px-3 py-2 text-sm text-success">
+                {success}
+              </p>
+            )}
             {error && (
               <p
                 role="alert"
@@ -646,45 +805,16 @@ function LoginPage() {
               </p>
             )}
             <Button className="h-11 w-full" type="submit" disabled={busy}>
-              {busy ? "Checking…" : "Continue with email"}
+              {busy
+                ? mode === "create"
+                  ? "Creating account…"
+                  : "Signing in…"
+                : mode === "create"
+                  ? "Create Account"
+                  : "Sign In"}
               <ArrowRight size={16} />
             </Button>
           </form>
-          <div className="my-6 flex items-center gap-3 text-[11px] text-muted-foreground">
-            <span className="h-px flex-1 bg-border" />
-            OR TRY A DEMO ROLE
-            <span className="h-px flex-1 bg-border" />
-          </div>
-          <div className="grid gap-3 sm:grid-cols-2">
-            <Button
-              variant="outline"
-              className="h-11 justify-start"
-              onClick={() => enter("customer")}
-            >
-              <UserRound size={17} />
-              <span className="text-left">
-                <span className="block">Customer</span>
-                <span className="block text-[10px] font-normal text-muted-foreground">
-                  Anaya Rao
-                </span>
-              </span>
-              <ArrowRight className="ml-auto" size={15} />
-            </Button>
-            <Button variant="outline" className="h-11 justify-start" onClick={() => enter("admin")}>
-              <ShieldCheck size={17} />
-              <span className="text-left">
-                <span className="block">Admin / Auditor</span>
-                <span className="block text-[10px] font-normal text-muted-foreground">
-                  Nisha Verma
-                </span>
-              </span>
-              <ArrowRight className="ml-auto" size={15} />
-            </Button>
-          </div>
-          <div className="mt-6 rounded-md border border-warning/35 bg-warning/10 p-3 text-xs leading-5 text-warning-foreground">
-            <CircleAlert className="mr-1.5 inline size-3.5" />
-            Demo authentication is simulated and is not production authentication.
-          </div>
           <Link
             to="/"
             className="mt-6 block text-center text-xs font-medium text-muted-foreground hover:text-foreground"
@@ -698,10 +828,13 @@ function LoginPage() {
 }
 
 function CustomerDashboard() {
-  const { requests } = useDemo();
+  const { userId } = useDemo();
   const navigate = useNavigate();
-  const request = requests.find((item) => item.customerId === "CUS-1042") ?? requests[0];
+  const profile = useCustomerProfile(userId);
+  const statusQuery = useCustomerStatus(userId);
+  const request = statusQuery.data;
   const verified = request?.status === "VERIFIED";
+  const hasRequest = Boolean(request);
   const stages = [
     "Documents required",
     "Documents submitted",
@@ -709,11 +842,33 @@ function CustomerDashboard() {
     "Manual review",
     "Final decision",
   ];
-  const activeIndex = verified ? 4 : request?.status === "UNDER_REVIEW" ? 3 : 1;
+  const activeIndex = verified ? 4 : request?.status === "UNDER_REVIEW" ? 3 : hasRequest ? 1 : 0;
+  if (statusQuery.isPending && !request) {
+    return (
+      <>
+        <PageHeading
+          title="Good morning"
+          description="Here’s the latest on your identity verification."
+        />
+        <LoadingState label="Loading your verification status…" />
+      </>
+    );
+  }
+  if (statusQuery.error && !isNotFound(statusQuery.error)) {
+    return (
+      <>
+        <PageHeading
+          title="Good morning"
+          description="Here’s the latest on your identity verification."
+        />
+        <ErrorState error={statusQuery.error} onRetry={() => void statusQuery.refetch()} />
+      </>
+    );
+  }
   return (
     <>
       <PageHeading
-        title="Good morning, Anaya"
+        title={`Good morning${profile.data?.name ? `, ${profile.data.name.split(" ")[0]}` : ""}`}
         description="Here’s the latest on your identity verification."
         action={
           <Button onClick={() => void navigate({ to: "/customer/submit" })}>
@@ -732,17 +887,21 @@ function CustomerDashboard() {
                   ? "Identity verified"
                   : request?.status === "REJECTED"
                     ? "Action required"
-                    : "Review in progress"}
+                    : hasRequest
+                      ? "Review in progress"
+                      : "No verification request yet"}
               </h2>
               <p className="mt-2 max-w-lg text-sm leading-6 text-muted-foreground">
                 {verified
                   ? "Your identity information has been reviewed successfully."
                   : request?.reason
                     ? request.reason
-                    : "Your documents are with our review team. We’ll update this page when there’s progress."}
+                    : hasRequest
+                      ? "Your documents are with our review team. We’ll update this page when there’s progress."
+                      : "You haven’t submitted any verification documents yet. Start by submitting your documents."}
               </p>
             </div>
-            <StatusBadge status={request?.status ?? "SUBMITTED"} />
+            {hasRequest && <StatusBadge status={request?.status ?? "SUBMITTED"} />}
           </div>
           <div className="mt-7 grid gap-0 sm:grid-cols-5">
             {stages.map((stage, index) => {
@@ -761,7 +920,7 @@ function CustomerDashboard() {
                     />
                   )}
                   <p
-                    className={`pt-1 text-xs sm:mt-3 sm:pr-2 ${active ? "font-semibold text-foreground" : "text-muted-foreground"}`}
+                    className={`pt-1 text-xs sm:mt-3 sm:pr-2 ${active && hasRequest ? "font-semibold text-foreground" : "text-muted-foreground"}`}
                   >
                     {stage}
                   </p>
@@ -774,7 +933,7 @@ function CustomerDashboard() {
           <div className="flex items-center justify-between">
             <div>
               <p className="text-sm font-medium text-muted-foreground">Reference number</p>
-              <p className="mt-2 text-lg font-semibold">{request?.id ?? "KYC-2841"}</p>
+              <p className="mt-2 text-lg font-semibold">{request?.id ?? "—"}</p>
             </div>
             <span className="grid size-10 place-items-center rounded-md bg-accent text-primary">
               <Fingerprint size={19} />
@@ -783,15 +942,17 @@ function CustomerDashboard() {
           <div className="mt-5 space-y-3 border-t border-border pt-4 text-sm">
             <div className="flex justify-between gap-3">
               <span className="text-muted-foreground">Submitted</span>
-              <span className="font-medium">{request?.submitted}</span>
+              <span className="font-medium">{request?.submitted ?? "—"}</span>
             </div>
             <div className="flex justify-between gap-3">
               <span className="text-muted-foreground">Documents</span>
-              <span className="font-medium">2 received</span>
+              <span className="font-medium">
+                {request ? `${request.documents.length} received` : "None"}
+              </span>
             </div>
             <div className="flex justify-between gap-3">
               <span className="text-muted-foreground">Last updated</span>
-              <span className="font-medium">{request?.updated}</span>
+              <span className="font-medium">{request?.updated ?? "—"}</span>
             </div>
           </div>
           <Button
@@ -823,25 +984,37 @@ function CustomerDashboard() {
                 <span className="min-w-0 flex-1">
                   <span className="block text-sm font-semibold">{name}</span>
                   <span className="mt-1 block text-xs text-muted-foreground">
-                    {request?.documents.includes(name) ? "Received · 12 Oct 2026" : "Not submitted"}
+                    {request?.documents.includes(name)
+                      ? `Received · ${request.submitted}`
+                      : "Not submitted"}
                   </span>
                 </span>
-                <CheckCircle2 className="text-success" size={17} />
+                {request?.documents.includes(name) ? (
+                  <CheckCircle2 className="text-success" size={17} />
+                ) : (
+                  <FileText className="text-muted-foreground" size={17} />
+                )}
               </div>
             ))}
           </div>
         </section>
         <section className="rounded-lg border border-border bg-card p-5">
           <h2 className="text-base font-semibold">Account details</h2>
-          <p className="mt-1 text-xs text-muted-foreground">Customer reference CUS-1042</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Customer reference {profile.data?.customerId ?? userId}
+          </p>
           <div className="mt-4 space-y-3 text-sm">
             <p className="flex justify-between gap-2">
+              <span className="text-muted-foreground">Name</span>
+              <span>{profile.data?.name ?? "—"}</span>
+            </p>
+            <p className="flex justify-between gap-2">
               <span className="text-muted-foreground">Email</span>
-              <span>an•••@example.test</span>
+              <span>{maskEmail(profile.data?.email)}</span>
             </p>
             <p className="flex justify-between gap-2">
               <span className="text-muted-foreground">Phone</span>
-              <span>+91 •••••• 4821</span>
+              <span>{maskPhone(profile.data?.phone)}</span>
             </p>
           </div>
           <Link
@@ -961,8 +1134,31 @@ function UploadCard({
 }
 
 function DocumentsPage() {
-  const { requests } = useDemo();
-  const current = requests.find((item) => item.customerId === "CUS-1042") ?? requests[0];
+  const { userId } = useDemo();
+  const statusQuery = useCustomerStatus(userId);
+  const current = statusQuery.data;
+  if (statusQuery.isPending && !current) {
+    return (
+      <>
+        <PageHeading
+          title="My documents"
+          description="Review documents associated with your identity verification."
+        />
+        <LoadingState label="Loading your documents…" />
+      </>
+    );
+  }
+  if (statusQuery.error && !isNotFound(statusQuery.error)) {
+    return (
+      <>
+        <PageHeading
+          title="My documents"
+          description="Review documents associated with your identity verification."
+        />
+        <ErrorState error={statusQuery.error} onRetry={() => void statusQuery.refetch()} />
+      </>
+    );
+  }
   return (
     <>
       <PageHeading
@@ -977,55 +1173,49 @@ function DocumentsPage() {
           </Link>
         }
       />
-      <div className="grid gap-4 md:grid-cols-2">
-        {["Aadhaar", "Voter ID"].map((doc) => (
-          <section key={doc} className="rounded-lg border border-border bg-card p-5">
-            <div className="flex items-center gap-3">
-              <span className="grid size-10 place-items-center rounded-md bg-accent text-primary">
-                <FileText size={18} />
-              </span>
-              <div className="flex-1">
-                <h2 className="font-semibold">{doc}</h2>
-                <p className="text-xs text-muted-foreground">Identity document</p>
-              </div>
-              <StatusBadge
-                status={
-                  !current?.documents.includes(doc)
-                    ? "NOT_SUBMITTED"
-                    : current.status === "VERIFIED"
-                      ? "VERIFIED"
-                      : "SUBMITTED"
-                }
-              />
-            </div>
-            <div className="mt-5 border-t border-border pt-4 text-sm">
-              <p className="flex justify-between">
-                <span className="text-muted-foreground">Document status</span>
-                <span>
-                  {!current?.documents.includes(doc)
-                    ? "Not submitted"
-                    : current.status === "VERIFIED"
-                      ? "Verified"
-                      : "Submitted"}
+      {!current || current.documents.length === 0 ? (
+        <EmptyState
+          title="No documents on record"
+          text="Submit your identity documents to begin the verification."
+        />
+      ) : (
+        <div className="grid gap-4 md:grid-cols-2">
+          {current.documents.map((doc) => (
+            <section key={doc} className="rounded-lg border border-border bg-card p-5">
+              <div className="flex items-center gap-3">
+                <span className="grid size-10 place-items-center rounded-md bg-accent text-primary">
+                  <FileText size={18} />
                 </span>
-              </p>
-              <p className="mt-3 flex justify-between">
-                <span className="text-muted-foreground">Request</span>
-                <span>{current?.id}</span>
-              </p>
-              <p className="mt-3 flex justify-between">
-                <span className="text-muted-foreground">Submitted</span>
-                <span>{current?.submitted ?? "—"}</span>
-              </p>
-            </div>
-          </section>
-        ))}
-      </div>
+                <div className="flex-1">
+                  <h2 className="font-semibold">{doc}</h2>
+                  <p className="text-xs text-muted-foreground">Identity document</p>
+                </div>
+                <StatusBadge status={current.status === "VERIFIED" ? "VERIFIED" : "SUBMITTED"} />
+              </div>
+              <div className="mt-5 border-t border-border pt-4 text-sm">
+                <p className="flex justify-between">
+                  <span className="text-muted-foreground">Document status</span>
+                  <span>{current.status === "VERIFIED" ? "Verified" : "Submitted"}</span>
+                </p>
+                <p className="mt-3 flex justify-between">
+                  <span className="text-muted-foreground">Request</span>
+                  <span>{current.id}</span>
+                </p>
+                <p className="mt-3 flex justify-between">
+                  <span className="text-muted-foreground">Submitted</span>
+                  <span>{current.submitted ?? "—"}</span>
+                </p>
+              </div>
+            </section>
+          ))}
+        </div>
+      )}
       <div className="mt-6 rounded-lg border border-border bg-card p-5">
         <h2 className="font-semibold">Document handling</h2>
         <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-          Files selected in this demo are held in page memory only for local preview. They are not
-          uploaded, saved, or sent to a verification service.
+          Files selected in this demo are held in page memory only for local preview. Submission
+          currently sends document-type metadata to the backend only — the files themselves are not
+          uploaded, saved, or sent to a verification service (see INTEGRATION_GAPS.md).
         </p>
       </div>
     </>
@@ -1033,44 +1223,73 @@ function DocumentsPage() {
 }
 
 function SubmitPage() {
-  const { submitDocuments } = useDemo();
+  const { userId } = useDemo();
+  const submitMutation = useSubmitDocuments();
   const navigate = useNavigate();
   const [aadhaar, setAadhaar] = useState<LocalFile>();
   const [voter, setVoter] = useState<LocalFile>();
-  const [busy, setBusy] = useState(false);
+  const [pan, setPan] = useState<LocalFile>();
+  const [error, setError] = useState("");
+  const busy = submitMutation.isPending;
   const submit = () => {
     if (!aadhaar || !voter) {
       toast.error("Add both documents before submitting.");
       return;
     }
-    setBusy(true);
-    window.setTimeout(() => {
-      const id = submitDocuments(["Aadhaar", "Voter ID"]);
-      setBusy(false);
-      toast.success(`Demo request ${id} submitted.`);
-      void navigate({ to: "/customer/status" });
-    }, 550);
+    setError("");
+    // The endpoint accepts document-type metadata only; the selected file bytes
+    // stay on this device (see INTEGRATION_GAPS.md for the backend change needed).
+    submitMutation.mutate(
+      {
+        files: ["Aadhaar", "Voter ID", ...(pan ? ["PAN Card"] : [])],
+        customerId: userId ?? undefined,
+      },
+      {
+        onSuccess: () => {
+          void navigate({ to: "/customer/status" });
+        },
+        onError: (err) => {
+          setError(
+            apiErrorMessage(
+              err instanceof ApiError ? err.detail : null,
+              err instanceof Error ? err.message : "Submission failed. Please try again.",
+            ),
+          );
+        },
+      },
+    );
   };
   useEffect(
     () => () => {
       if (aadhaar?.url) URL.revokeObjectURL(aadhaar.url);
       if (voter?.url) URL.revokeObjectURL(voter.url);
+      if (pan?.url) URL.revokeObjectURL(pan.url);
     },
-    [aadhaar?.url, voter?.url],
+    [aadhaar?.url, voter?.url, pan?.url],
   );
   return (
     <>
       <PageHeading
         title="Submit documents"
-        description="Add both required documents to start a simulated review."
+        description="Add both required documents to start the verification review."
       />
       <div className="grid gap-5 lg:grid-cols-[1fr_320px]">
         <div className="space-y-4">
           <UploadCard title="Aadhaar" value={aadhaar} onChange={setAadhaar} />
           <UploadCard title="Voter ID" value={voter} onChange={setVoter} />
+          <UploadCard title="PAN Card (optional)" value={pan} onChange={setPan} />
+          {error && (
+            <p
+              role="alert"
+              className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            >
+              {error}
+            </p>
+          )}
           <div className="flex flex-col justify-between gap-3 rounded-lg border border-border bg-card p-4 sm:flex-row sm:items-center">
             <p className="text-xs text-muted-foreground">
-              By continuing, you confirm these fictional files are for demo purposes only.
+              By continuing, your document types are recorded with the verification service. Demo
+              files remain on your device.
             </p>
             <Button onClick={submit} disabled={busy}>
               {busy ? "Submitting…" : "Confirm and submit"}
@@ -1082,11 +1301,12 @@ function SubmitPage() {
           <p className="text-xs font-semibold uppercase tracking-wider text-primary">
             Submission checklist
           </p>
-          <h2 className="mt-2 text-lg font-semibold">Two documents required</h2>
+          <h2 className="mt-2 text-lg font-semibold">Two documents required, PAN optional</h2>
           <div className="mt-5 space-y-3">
             {[
               { label: "Aadhaar", done: Boolean(aadhaar) },
               { label: "Voter ID", done: Boolean(voter) },
+              { label: "PAN Card (optional)", done: Boolean(pan) },
               { label: "Review & confirm", done: Boolean(aadhaar && voter) },
             ].map(({ label, done }) => (
               <div key={label} className="flex items-center gap-3 text-sm">
@@ -1101,7 +1321,7 @@ function SubmitPage() {
           </div>
           <p className="mt-5 border-t border-border pt-4 text-xs leading-5 text-muted-foreground">
             Accepted files: PDF, JPG and PNG. Maximum 10 MB per file. The selected files remain on
-            this device in the current page only.
+            this device — only the document types are sent to the API in this release.
           </p>
         </aside>
       </div>
@@ -1109,7 +1329,7 @@ function SubmitPage() {
   );
 }
 
-function Timeline({ request }: { request: DemoRequest }) {
+function Timeline({ request }: { request: KycRequestSummary }) {
   const steps = [
     "Documents submitted",
     "Information comparison",
@@ -1165,8 +1385,31 @@ function Timeline({ request }: { request: DemoRequest }) {
 }
 
 function StatusPage() {
-  const { requests } = useDemo();
-  const request = requests.find((item) => item.customerId === "CUS-1042") ?? requests[0];
+  const { userId } = useDemo();
+  const statusQuery = useCustomerStatus(userId);
+  const request = statusQuery.data;
+  if (statusQuery.isPending && !request) {
+    return (
+      <>
+        <PageHeading
+          title="Verification status"
+          description="Track your request and see the latest review update."
+        />
+        <LoadingState label="Loading verification status…" />
+      </>
+    );
+  }
+  if (statusQuery.error && !isNotFound(statusQuery.error)) {
+    return (
+      <>
+        <PageHeading
+          title="Verification status"
+          description="Track your request and see the latest review update."
+        />
+        <ErrorState error={statusQuery.error} onRetry={() => void statusQuery.refetch()} />
+      </>
+    );
+  }
   if (!request)
     return (
       <EmptyState title="No verification request" text="Submit your identity documents to begin." />
@@ -1203,7 +1446,7 @@ function StatusPage() {
           <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground">
             {request.reason ??
               (request.status === "VERIFIED"
-                ? "Your identity details have been marked verified in this demo."
+                ? "Your identity details have been marked verified by the review team."
                 : "Your documents have been received. The review team is comparing the submitted details.")}
           </p>
           <div className="mt-7 border-t border-border pt-6">
@@ -1250,40 +1493,64 @@ function StatusPage() {
 }
 
 function ProfilePage({ admin = false }: { admin?: boolean }) {
-  const { requests } = useDemo();
-  const req = requests.find((item) => item.customerId === "CUS-1042") ?? requests[0];
+  const { userId, name: sessionName, email: sessionEmail, session } = useDemo();
+  const profile = useCustomerProfile(admin ? null : userId);
+  const statusQuery = useCustomerStatus(admin ? null : userId);
+  const req = statusQuery.data;
   const entries = admin
     ? [
-        ["Name", "Nisha Verma"],
+        ["Name", sessionName ?? "Admin reviewer"],
         ["Role", "Compliance reviewer"],
-        ["Email", "ni•••@pramana.demo"],
-        ["Workspace", "Operations · Demo"],
+        ["Email", maskEmail(sessionEmail)],
+        ["Workspace", "Operations"],
       ]
     : [
-        ["Full name", "Anaya Rao"],
-        ["Customer reference", "CUS-1042"],
-        ["Email address", "an•••@example.test"],
-        ["Phone number", "+91 •••••• 4821"],
-        ["Date of birth", "14 Mar 1994"],
-        ["Address", "18 Lake View Road, Pune"],
-        ["Account created", "04 Feb 2025"],
-        ["KYC status", req?.status.replaceAll("_", " ") ?? "Submitted"],
+        ["Full name", profile.data?.name ?? "—"],
+        ["Customer reference", profile.data?.customerId ?? userId ?? "—"],
+        ["Email address", maskEmail(profile.data?.email ?? sessionEmail)],
+        ["Phone number", maskPhone(profile.data?.phone)],
+        ["Date of birth", profile.data?.dob ?? "—"],
+        ["Address", profile.data?.address ?? "—"],
+        [
+          "KYC status",
+          req?.status.replaceAll("_", " ") ?? profile.data?.kycStatus.replaceAll("_", " ") ?? "—",
+        ],
       ];
+  if (!admin && profile.isPending && !profile.data) {
+    return (
+      <>
+        <PageHeading title="Customer profile" description="Your recorded identity details." />
+        <LoadingState label="Loading profile…" />
+      </>
+    );
+  }
+  if (!admin && profile.error && !isNotFound(profile.error)) {
+    return (
+      <>
+        <PageHeading title="Customer profile" description="Your recorded identity details." />
+        <ErrorState error={profile.error} onRetry={() => void profile.refetch()} />
+      </>
+    );
+  }
   return (
     <>
       <PageHeading
         title={admin ? "My profile" : "Customer profile"}
-        description="Fictional account information for this demo."
+        description="Details recorded by the Pramāṇa backend. Contact details are masked."
       />
       <div className="max-w-3xl rounded-lg border border-border bg-card">
         <div className="flex items-center gap-4 border-b border-border p-5 sm:p-6">
           <span className="grid size-14 place-items-center rounded-full bg-accent text-lg font-semibold text-primary">
-            {admin ? "NV" : "AR"}
+            {admin ? initials(sessionName, "AD") : initials(profile.data?.name, "CU")}
           </span>
           <div>
-            <h2 className="text-lg font-semibold">{admin ? "Nisha Verma" : "Anaya Rao"}</h2>
+            <h2 className="text-lg font-semibold">
+              {admin ? (sessionName ?? "Admin reviewer") : (profile.data?.name ?? "—")}
+            </h2>
             <p className="mt-1 text-sm text-muted-foreground">
-              {admin ? "Admin / Auditor" : "Customer · CUS-1042"}
+              {admin
+                ? "Admin / Auditor"
+                : `Customer · ${profile.data?.customerId ?? userId ?? "—"}`}
             </p>
           </div>
         </div>
@@ -1320,10 +1587,59 @@ function EmptyState({ title, text }: { title: string; text: string }) {
   );
 }
 
-function RequestsTable({ rows }: { rows: DemoRequest[] }) {
+function LoadingState({ label = "Loading…", className }: { label?: string; className?: string }) {
+  return (
+    <div
+      className={`grid min-h-64 place-items-center rounded-lg border border-dashed border-border bg-card px-5 py-10 text-center ${className ?? ""}`}
+    >
+      <div>
+        <span className="mx-auto grid size-11 place-items-center rounded-full bg-secondary text-muted-foreground">
+          <RefreshCw size={19} className="animate-spin" />
+        </span>
+        <h3 className="mt-3 font-semibold">{label}</h3>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Fetching live data from the Pramāṇa API.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function ErrorState({ error, onRetry }: { error: unknown; onRetry?: () => void }) {
+  const status = error instanceof ApiError ? error.status : undefined;
+  const message = apiErrorMessage(
+    error instanceof ApiError ? error.detail : null,
+    error instanceof Error && !(error instanceof ApiError)
+      ? error.message
+      : "The Pramāṇa API returned an unexpected error.",
+  );
+  return (
+    <div className="grid min-h-64 place-items-center rounded-lg border border-dashed border-destructive/50 bg-card px-5 py-10 text-center">
+      <div className="max-w-md">
+        <span className="mx-auto grid size-11 place-items-center rounded-full bg-destructive/10 text-destructive">
+          <CircleAlert size={19} />
+        </span>
+        <h3 className="mt-3 font-semibold">
+          {status === 404 ? "Not found" : "Could not load data"}
+        </h3>
+        <p className="mt-1 text-sm text-muted-foreground">{message}</p>
+        {onRetry && (
+          <Button variant="outline" size="sm" className="mt-4" onClick={onRetry}>
+            <RefreshCw size={14} />
+            Try again
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function RequestsTable({ rows }: { rows: KycRequestSummary[] }) {
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("All statuses");
-  const [sort, setSort] = useState(false);
+  // The review queue should lead with the most recent submission. This also
+  // keeps a resubmitted request visible even when its database ID is older.
+  const [sort, setSort] = useState(true);
   const [page, setPage] = useState(0);
   const navigate = useNavigate();
   const filtered = useMemo(
@@ -1513,13 +1829,18 @@ function RequestsTable({ rows }: { rows: DemoRequest[] }) {
   );
 }
 
-function AdminDashboard({ requests }: { requests: DemoRequest[] }) {
-  const pending = requests.filter((item) => ["UNDER_REVIEW", "SUBMITTED"].includes(item.status));
-  const verified = requests.filter((item) => item.status === "VERIFIED").length;
-  const rejected = requests.filter((item) => item.status === "REJECTED").length;
-  const mismatch = requests.filter((item) =>
+function AdminDashboard() {
+  const requestsQuery = useAdminRequests();
+  const requests = requestsQuery.data;
+  const pending = (requests ?? []).filter((item) =>
+    ["UNDER_REVIEW", "SUBMITTED"].includes(item.status),
+  );
+  const verified = (requests ?? []).filter((item) => item.status === "VERIFIED").length;
+  const rejected = (requests ?? []).filter((item) => item.status === "REJECTED").length;
+  const mismatch = (requests ?? []).filter((item) =>
     item.fields.some((field) => field.result === "MISMATCH"),
   ).length;
+  const total = requests?.length ?? 0;
   return (
     <>
       <PageHeading
@@ -1533,100 +1854,116 @@ function AdminDashboard({ requests }: { requests: DemoRequest[] }) {
           </Link>
         }
       />
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <Metric
-          label="Total requests"
-          value={requests.length}
-          note="All demo requests"
-          icon={FileCheck2}
-        />
-        <Metric
-          label="Pending review"
-          value={pending.length}
-          note="Needs attention"
-          icon={Clock3}
-          tone="amber"
-        />
-        <Metric label="Verified" value={verified} note="Completed" icon={BadgeCheck} tone="green" />
-        <Metric
-          label="Rejected"
-          value={rejected}
-          note="Decision recorded"
-          icon={CircleAlert}
-          tone="red"
-        />
-      </div>
-      <div className="mt-5 grid gap-5 xl:grid-cols-[1.3fr_.7fr]">
-        <section className="rounded-lg border border-border bg-card p-5">
-          <div className="mb-4 flex items-center justify-between">
-            <div>
-              <h2 className="font-semibold">Recent requests</h2>
-              <p className="mt-1 text-xs text-muted-foreground">
-                Latest activity in the review queue
-              </p>
-            </div>
-            <Link className="text-xs font-medium text-primary" to="/admin/requests">
-              View all
-            </Link>
+      {requestsQuery.isPending && !requests ? (
+        <LoadingState label="Loading request statistics…" />
+      ) : requestsQuery.error ? (
+        <ErrorState error={requestsQuery.error} onRetry={() => void requestsQuery.refetch()} />
+      ) : (
+        <>
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <Metric
+              label="Total requests"
+              value={total}
+              note="All API requests"
+              icon={FileCheck2}
+            />
+            <Metric
+              label="Pending review"
+              value={pending.length}
+              note="Needs attention"
+              icon={Clock3}
+              tone="amber"
+            />
+            <Metric
+              label="Verified"
+              value={verified}
+              note="Completed"
+              icon={BadgeCheck}
+              tone="green"
+            />
+            <Metric
+              label="Rejected"
+              value={rejected}
+              note="Decision recorded"
+              icon={CircleAlert}
+              tone="red"
+            />
           </div>
-          <RequestsTable rows={requests.slice(0, 4)} />
-        </section>
-        <section className="rounded-lg border border-border bg-card p-5">
-          <div className="flex items-center justify-between">
-            <div>
-              <h2 className="font-semibold">Review snapshot</h2>
-              <p className="mt-1 text-xs text-muted-foreground">Request status distribution</p>
-            </div>
-            <span className="grid size-9 place-items-center rounded-md bg-accent text-primary">
-              <Gauge size={17} />
-            </span>
-          </div>
-          <div className="mt-6 space-y-4">
-            {[
-              { label: "Pending review", count: pending.length, color: "bg-warning" },
-              { label: "Verified", count: verified, color: "bg-success" },
-              { label: "Rejected", count: rejected, color: "bg-destructive" },
-            ].map(({ label, count, color }) => (
-              <div key={label}>
-                <div className="mb-1.5 flex justify-between text-xs">
-                  <span>{label}</span>
-                  <span className="font-semibold">{count}</span>
+          <div className="mt-5 grid gap-5 xl:grid-cols-[1.3fr_.7fr]">
+            <section className="rounded-lg border border-border bg-card p-5">
+              <div className="mb-4 flex items-center justify-between">
+                <div>
+                  <h2 className="font-semibold">Recent requests</h2>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Latest activity in the review queue
+                  </p>
                 </div>
-                <div className="h-2 overflow-hidden rounded-full bg-secondary">
-                  <div
-                    className={`h-full rounded-full ${color}`}
-                    style={{
-                      width: `${requests.length ? Math.max((count / requests.length) * 100, 4) : 0}%`,
-                    }}
-                  />
-                </div>
+                <Link className="text-xs font-medium text-primary" to="/admin/requests">
+                  View all
+                </Link>
               </div>
-            ))}
+              <RequestsTable rows={(requests ?? []).slice(0, 4)} />
+            </section>
+            <section className="rounded-lg border border-border bg-card p-5">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h2 className="font-semibold">Review snapshot</h2>
+                  <p className="mt-1 text-xs text-muted-foreground">Request status distribution</p>
+                </div>
+                <span className="grid size-9 place-items-center rounded-md bg-accent text-primary">
+                  <Gauge size={17} />
+                </span>
+              </div>
+              <div className="mt-6 space-y-4">
+                {[
+                  { label: "Pending review", count: pending.length, color: "bg-warning" },
+                  { label: "Verified", count: verified, color: "bg-success" },
+                  { label: "Rejected", count: rejected, color: "bg-destructive" },
+                ].map(({ label, count, color }) => (
+                  <div key={label}>
+                    <div className="mb-1.5 flex justify-between text-xs">
+                      <span>{label}</span>
+                      <span className="font-semibold">{count}</span>
+                    </div>
+                    <div className="h-2 overflow-hidden rounded-full bg-secondary">
+                      <div
+                        className={`h-full rounded-full ${color}`}
+                        style={{
+                          width: `${total ? Math.max((count / total) * 100, 4) : 0}%`,
+                        }}
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-6 flex items-start gap-3 rounded-md border border-warning/35 bg-warning/10 p-3">
+                <span className="grid size-8 shrink-0 place-items-center rounded bg-warning/20 text-warning-foreground">
+                  <ListFilter size={16} />
+                </span>
+                <p className="text-xs leading-5 text-warning-foreground">
+                  <span className="font-semibold">
+                    {mismatch} mismatch case{mismatch === 1 ? "" : "s"}
+                  </span>{" "}
+                  require field-level review before a decision.
+                </p>
+              </div>
+              <Link
+                to="/admin/requests"
+                className="mt-5 flex h-9 items-center justify-center gap-2 rounded-md border border-border text-xs font-medium transition-colors hover:bg-accent"
+              >
+                Go to review queue <ArrowRight size={14} />
+              </Link>
+            </section>
           </div>
-          <div className="mt-6 flex items-start gap-3 rounded-md border border-warning/35 bg-warning/10 p-3">
-            <span className="grid size-8 shrink-0 place-items-center rounded bg-warning/20 text-warning-foreground">
-              <ListFilter size={16} />
-            </span>
-            <p className="text-xs leading-5 text-warning-foreground">
-              <span className="font-semibold">
-                {mismatch} mismatch case{mismatch === 1 ? "" : "s"}
-              </span>{" "}
-              require field-level review before a decision.
-            </p>
-          </div>
-          <Link
-            to="/admin/requests"
-            className="mt-5 flex h-9 items-center justify-center gap-2 rounded-md border border-border text-xs font-medium transition-colors hover:bg-accent"
-          >
-            Go to review queue <ArrowRight size={14} />
-          </Link>
-        </section>
-      </div>
+        </>
+      )}
     </>
   );
 }
 
-function RequestsPage({ requests }: { requests: DemoRequest[] }) {
+function RequestsPage() {
+  const requestsQuery = useAdminRequests();
+  const requests = requestsQuery.data ?? [];
   const [quick, setQuick] = useState("All requests");
   const filtered = requests.filter(
     (item) =>
@@ -1641,27 +1978,35 @@ function RequestsPage({ requests }: { requests: DemoRequest[] }) {
         title="Request queue"
         description="Search and review submitted identity verification requests."
       />
-      <div className="mb-4 flex flex-wrap gap-2">
-        {["All requests", "Pending review", "Verified", "Rejected"].map((filter) => (
-          <Button
-            key={filter}
-            variant={quick === filter ? "default" : "outline"}
-            size="sm"
-            onClick={() => setQuick(filter)}
-          >
-            {filter}
-            {filter === "All requests" && (
-              <span className="ml-1 opacity-70">{requests.length}</span>
-            )}
-          </Button>
-        ))}
-      </div>
-      <RequestsTable rows={filtered} />
+      {requestsQuery.isPending && !requestsQuery.data ? (
+        <LoadingState label="Loading the request queue…" />
+      ) : requestsQuery.error ? (
+        <ErrorState error={requestsQuery.error} onRetry={() => void requestsQuery.refetch()} />
+      ) : (
+        <>
+          <div className="mb-4 flex flex-wrap gap-2">
+            {["All requests", "Pending review", "Verified", "Rejected"].map((filter) => (
+              <Button
+                key={filter}
+                variant={quick === filter ? "default" : "outline"}
+                size="sm"
+                onClick={() => setQuick(filter)}
+              >
+                {filter}
+                {filter === "All requests" && (
+                  <span className="ml-1 opacity-70">{requestsQuery.data?.length ?? 0}</span>
+                )}
+              </Button>
+            ))}
+          </div>
+          <RequestsTable rows={filtered} />
+        </>
+      )}
     </>
   );
 }
 
-function ComparisonResult({ result }: { result: MatchStatus }) {
+function ComparisonResult({ result }: { result: string }) {
   const tones =
     result === "MATCH"
       ? "status-success"
@@ -1678,21 +2023,32 @@ function ComparisonResult({ result }: { result: MatchStatus }) {
 }
 
 function RequestDetail({ id }: { id: string }) {
-  const { request, process, reject, updateAndProcess } = useDemo();
+  const { name: adminName } = useDemo();
+  const requestQuery = useAdminRequest(id);
+  const item = requestQuery.data;
+  const processMutation = useProcessRequest(id);
+  const rejectMutation = useRejectRequest(id);
+  const updateMutation = useUpdateAndProcessRequest(id);
   const navigate = useNavigate();
-  const item = request(id);
   const [dialog, setDialog] = useState<"process" | "reject" | "update" | null>(null);
   const [reason, setReason] = useState("");
   const [field, setField] = useState("");
   const [proposed, setProposed] = useState("");
-  const [busy, setBusy] = useState(false);
-  if (!item)
-    return (
+  const busy = processMutation.isPending || rejectMutation.isPending || updateMutation.isPending;
+  if (requestQuery.isPending && !item) {
+    return <LoadingState label="Loading verification request…" />;
+  }
+  if (requestQuery.error) {
+    return isNotFound(requestQuery.error) ? (
       <EmptyState
         title="Request not found"
-        text="This request may have been reset or removed from the demo."
+        text="This verification request does not exist in the backend."
       />
+    ) : (
+      <ErrorState error={requestQuery.error} onRetry={() => void requestQuery.refetch()} />
     );
+  }
+  if (!item) return null;
   const counts = {
     MATCH: item.fields.filter((entry) => entry.result === "MATCH").length,
     MISMATCH: item.fields.filter((entry) => entry.result === "MISMATCH").length,
@@ -1700,34 +2056,77 @@ function RequestDetail({ id }: { id: string }) {
   };
   const hasIssues = counts.MISMATCH > 0 || counts.UNCERTAIN > 0;
   const canProcess = item.status !== "VERIFIED" && item.status !== "REJECTED" && !hasIssues;
+  const requiredFieldsOk =
+    dialog === "reject"
+      ? Boolean(reason.trim())
+      : dialog === "update"
+        ? Boolean(field.trim() && proposed.trim() && reason.trim())
+        : true;
   const save = () => {
-    if (dialog === "reject" && !reason.trim()) {
-      toast.error("Enter a reason before rejecting this request.");
+    if (dialog === "reject") {
+      if (!reason.trim()) {
+        toast.error("Enter a reason before rejecting this request.");
+        return;
+      }
+      rejectMutation.mutate(
+        { reason: reason.trim(), adminName: adminName ?? undefined },
+        {
+          onSuccess: () => {
+            setDialog(null);
+            setReason("");
+          },
+          onError: (err) =>
+            toast.error(
+              apiErrorMessage(
+                err instanceof ApiError ? err.detail : null,
+                err instanceof Error ? err.message : "Rejection failed. Please try again.",
+              ),
+            ),
+        },
+      );
       return;
     }
-    if (dialog === "update" && (!reason.trim() || !proposed.trim())) {
-      toast.error("Enter a proposed value and a reason.");
+    if (dialog === "update") {
+      if (!reason.trim() || !proposed.trim() || !field.trim()) {
+        toast.error("Enter a proposed value and a reason.");
+        return;
+      }
+      updateMutation.mutate(
+        { field, value: proposed.trim(), reason: reason.trim(), adminName: adminName ?? undefined },
+        {
+          onSuccess: () => {
+            setDialog(null);
+            setReason("");
+            setProposed("");
+          },
+          onError: (err) =>
+            // Surface the real API error (e.g. "Field not found") and keep the
+            // admin's form values so they can correct it.
+            toast.error(
+              apiErrorMessage(
+                err instanceof ApiError ? err.detail : null,
+                err instanceof Error ? err.message : "Update failed. Please try again.",
+              ),
+            ),
+        },
+      );
       return;
     }
-    setBusy(true);
-    window.setTimeout(() => {
-      if (dialog === "reject") {
-        reject(item.id, reason.trim());
-        toast.success("Demo request rejected.");
-      }
-      if (dialog === "update") {
-        updateAndProcess(item.id, field, proposed.trim(), reason.trim());
-        toast.success("Demo record updated and request verified.");
-      }
-      if (dialog === "process") {
-        process(item.id);
-        toast.success("Demo request marked verified.");
-      }
-      setBusy(false);
-      setDialog(null);
-      setReason("");
-      setProposed("");
-    }, 500);
+    if (dialog === "process") {
+      processMutation.mutate(
+        { adminName: adminName ?? undefined },
+        {
+          onSuccess: () => setDialog(null),
+          onError: (err) =>
+            toast.error(
+              apiErrorMessage(
+                err instanceof ApiError ? err.detail : null,
+                err instanceof Error ? err.message : "Processing failed. Please try again.",
+              ),
+            ),
+        },
+      );
+    }
   };
   const openUpdate = () => {
     const mismatch = item.fields.find((entry) => entry.result === "MISMATCH");
@@ -1808,12 +2207,12 @@ function RequestDetail({ id }: { id: string }) {
               <div>
                 <h2 className="font-semibold">Field comparison</h2>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  Simulated extraction results · not a real identity check
+                  Extracted values from the verification engine · not a real identity check
                 </p>
               </div>
               <span className="status-pill status-neutral">
                 <Activity size={12} />
-                Demo extraction
+                API extraction
               </span>
             </div>
             <div className="overflow-x-auto">
@@ -1860,7 +2259,7 @@ function RequestDetail({ id }: { id: string }) {
                   Synthetic preview cards · no real identity images
                 </p>
               </div>
-              <span className="status-pill status-neutral">2 documents</span>
+              <span className="status-pill status-neutral">{item.documents.length} documents</span>
             </div>
             <div className="mt-4 grid gap-3 sm:grid-cols-2">
               {item.documents.map((doc, index) => (
@@ -1901,7 +2300,7 @@ function RequestDetail({ id }: { id: string }) {
           <section className="rounded-lg border border-border bg-card p-5">
             <h2 className="font-semibold">Verification summary</h2>
             <p className="mt-1 text-xs text-muted-foreground">
-              Based on simulated field comparison
+              Based on the field comparison returned by the API
             </p>
             <div className="mt-4 grid grid-cols-3 gap-2">
               {[
@@ -1926,7 +2325,7 @@ function RequestDetail({ id }: { id: string }) {
           <section className="rounded-lg border border-border bg-card p-5">
             <h2 className="font-semibold">Existing customer record</h2>
             <p className="mt-1 text-xs text-muted-foreground">
-              Fictional baseline · {item.customerId}
+              Customer baseline · {item.customerId}
             </p>
             <div className="mt-4 space-y-3 text-sm">
               <p className="flex justify-between gap-3">
@@ -1955,7 +2354,12 @@ function RequestDetail({ id }: { id: string }) {
           if (!open) setDialog(null);
         }}
       >
-        <DialogContent>
+        <DialogContent
+          // Avoid Radix moving focus into a controlled field while the dialog
+          // is mounting. This also keeps the dialog usable in environments
+          // where programmatic focus is unavailable.
+          onOpenAutoFocus={(event) => event.preventDefault()}
+        >
           <DialogHeader>
             <DialogTitle>
               {dialog === "process"
@@ -1966,7 +2370,7 @@ function RequestDetail({ id }: { id: string }) {
             </DialogTitle>
             <DialogDescription>
               {dialog === "process"
-                ? `Request ${item.id} will be marked verified in the demo.`
+                ? `Request ${item.id} will be marked verified in the backend.`
                 : dialog === "reject"
                   ? `A reason is required before rejecting ${item.id}.`
                   : `Correct a supported field and include the reason for request ${item.id}.`}
@@ -2029,7 +2433,8 @@ function RequestDetail({ id }: { id: string }) {
                 />
               </label>
               <p className="text-xs text-muted-foreground">
-                Confirming records the correction and marks this demo request verified.
+                Confirming records the correction in the backend and marks the request verified when
+                every field matches.
               </p>
             </div>
           )}
@@ -2051,7 +2456,7 @@ function RequestDetail({ id }: { id: string }) {
             <Button
               variant={dialog === "reject" ? "destructive" : "default"}
               onClick={save}
-              disabled={busy}
+              disabled={busy || !requiredFieldsOk}
             >
               {busy
                 ? "Saving…"
@@ -2069,136 +2474,171 @@ function RequestDetail({ id }: { id: string }) {
 }
 
 function AuditPage() {
-  const { audit } = useDemo();
-  const [query, setQuery] = useState("");
+  const query = useAuditLogs();
+  const audit = query.data ?? [];
+  const [searchText, setSearchText] = useState("");
   const [expanded, setExpanded] = useState<string | null>(null);
   const [action, setAction] = useState("All actions");
   const filtered = audit.filter(
     (event) =>
-      `${event.id} ${event.customerId} ${event.customer} ${event.requestId} ${event.admin}`
+      `${event.id} ${event.customerId} ${event.customer} ${event.requestId ?? ""} ${event.admin}`
         .toLowerCase()
-        .includes(query.toLowerCase()) &&
+        .includes(searchText.toLowerCase()) &&
       (action === "All actions" || event.action.toLowerCase().includes(action.toLowerCase())),
   );
   return (
     <>
       <PageHeading
         title="Audit history"
-        description="A read-only record of simulated reviewer decisions and changes."
+        description="A read-only record of reviewer decisions and recorded changes."
       />
-      <DemoBanner>Demo audit · Entries are locally simulated and cannot be edited</DemoBanner>
-      <div className="my-4 flex flex-col gap-3 sm:flex-row">
-        <div className="relative flex-1">
-          <Search
-            size={15}
-            className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground"
-          />
-          <Input
-            className="pl-9"
-            placeholder="Search customer, request or reviewer"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            aria-label="Search audit history"
-          />
+      <DemoBanner>
+        Live audit trail · Entries are recorded by the backend and cannot be edited
+      </DemoBanner>
+      {query.isPending && !query.data && audit.length === 0 ? (
+        <div className="mt-4">
+          <LoadingState label="Loading audit history…" />
         </div>
-        <select
-          className="h-9 rounded-md border border-input bg-card px-3 text-sm"
-          value={action}
-          onChange={(event) => setAction(event.target.value)}
-          aria-label="Filter audit action"
-        >
-          {["All actions", "verified", "rejected", "corrected"].map((item) => (
-            <option key={item}>{item}</option>
-          ))}
-        </select>
-      </div>
-      {filtered.length === 0 ? (
-        <EmptyState
-          title="No audit events found"
-          text="Actions completed in this demo will appear here."
-        />
+      ) : query.error ? (
+        <div className="mt-4">
+          <ErrorState error={query.error} onRetry={() => void query.refetch()} />
+        </div>
       ) : (
-        <div className="overflow-x-auto rounded-lg border border-border bg-card">
-          <table className="w-full min-w-[900px] text-left text-sm">
-            <thead className="border-b border-border bg-background text-[11px] uppercase tracking-wider text-muted-foreground">
-              <tr>
-                {[
-                  "Timestamp",
-                  "Audit record",
-                  "Customer / request",
-                  "Reviewer",
-                  "Action",
-                  "Field change",
-                  "",
-                ].map((head) => (
-                  <th key={head} className="px-4 py-3 font-medium">
-                    {head}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-border">
-              {filtered.map((event) => (
-                <Fragment key={event.id}>
-                  <tr
-                    className="cursor-pointer hover:bg-accent/20"
-                    onClick={() => setExpanded(expanded === event.id ? null : event.id)}
-                  >
-                    <td className="px-4 py-3 text-xs text-muted-foreground">{event.timestamp}</td>
-                    <td className="px-4 py-3 font-medium">{event.id}</td>
-                    <td className="px-4 py-3">
-                      <p className="text-xs font-medium">{event.customer}</p>
-                      <p className="mt-1 text-[10px] text-muted-foreground">
-                        {event.customerId} · {event.requestId}
-                      </p>
-                    </td>
-                    <td className="px-4 py-3 text-xs">{event.admin}</td>
-                    <td className="px-4 py-3 text-xs">{event.action}</td>
-                    <td className="px-4 py-3 text-xs text-muted-foreground">{event.field}</td>
-                    <td className="px-4 py-3">
-                      <ChevronDown
-                        size={15}
-                        className={`transition-transform ${expanded === event.id ? "rotate-180" : ""}`}
-                      />
-                    </td>
-                  </tr>
-                  {expanded === event.id && (
-                    <tr className="bg-background">
-                      <td colSpan={7} className="px-5 py-4">
-                        <div className="grid gap-3 text-xs sm:grid-cols-4">
-                          <div>
-                            <p className="text-muted-foreground">Previous value</p>
-                            <p className="mt-1 font-medium">{event.previous}</p>
-                          </div>
-                          <div>
-                            <p className="text-muted-foreground">New value</p>
-                            <p className="mt-1 font-medium">{event.next}</p>
-                          </div>
-                          <div className="sm:col-span-2">
-                            <p className="text-muted-foreground">Reason</p>
-                            <p className="mt-1 font-medium">{event.reason}</p>
-                          </div>
-                        </div>
-                      </td>
-                    </tr>
-                  )}
-                </Fragment>
+        <>
+          <div className="my-4 flex flex-col gap-3 sm:flex-row">
+            <div className="relative flex-1">
+              <Search
+                size={15}
+                className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground"
+              />
+              <Input
+                className="pl-9"
+                placeholder="Search customer, request or reviewer"
+                value={searchText}
+                onChange={(event) => setSearchText(event.target.value)}
+                aria-label="Search audit history"
+              />
+            </div>
+            <select
+              className="h-9 rounded-md border border-input bg-card px-3 text-sm"
+              value={action}
+              onChange={(event) => setAction(event.target.value)}
+              aria-label="Filter audit action"
+            >
+              {["All actions", "verified", "rejected", "corrected"].map((item) => (
+                <option key={item}>{item}</option>
               ))}
-            </tbody>
-          </table>
-        </div>
+            </select>
+          </div>
+          {filtered.length === 0 ? (
+            <EmptyState
+              title="No audit events found"
+              text="Actions recorded by reviewers will appear here."
+            />
+          ) : (
+            <div className="overflow-x-auto rounded-lg border border-border bg-card">
+              <table className="w-full min-w-[900px] text-left text-sm">
+                <thead className="border-b border-border bg-background text-[11px] uppercase tracking-wider text-muted-foreground">
+                  <tr>
+                    {[
+                      "Timestamp",
+                      "Audit record",
+                      "Customer / request",
+                      "Reviewer",
+                      "Action",
+                      "Field change",
+                      "",
+                    ].map((head) => (
+                      <th key={head} className="px-4 py-3 font-medium">
+                        {head}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border">
+                  {filtered.map((event) => (
+                    <Fragment key={event.id}>
+                      <tr
+                        className="cursor-pointer hover:bg-accent/20"
+                        onClick={() => setExpanded(expanded === event.id ? null : event.id)}
+                      >
+                        <td className="px-4 py-3 text-xs text-muted-foreground">
+                          {event.timestamp}
+                        </td>
+                        <td className="px-4 py-3 font-medium">{event.id}</td>
+                        <td className="px-4 py-3">
+                          <p className="text-xs font-medium">{event.customer}</p>
+                          <p className="mt-1 text-[10px] text-muted-foreground">
+                            {event.customerId} · {event.requestId}
+                          </p>
+                        </td>
+                        <td className="px-4 py-3 text-xs">{event.admin}</td>
+                        <td className="px-4 py-3 text-xs">{event.action}</td>
+                        <td className="px-4 py-3 text-xs text-muted-foreground">{event.field}</td>
+                        <td className="px-4 py-3">
+                          <ChevronDown
+                            size={15}
+                            className={`transition-transform ${expanded === event.id ? "rotate-180" : ""}`}
+                          />
+                        </td>
+                      </tr>
+                      {expanded === event.id && (
+                        <tr className="bg-background">
+                          <td colSpan={7} className="px-5 py-4">
+                            <div className="grid gap-3 text-xs sm:grid-cols-4">
+                              <div>
+                                <p className="text-muted-foreground">Previous value</p>
+                                <p className="mt-1 font-medium">{event.previous}</p>
+                              </div>
+                              <div>
+                                <p className="text-muted-foreground">New value</p>
+                                <p className="mt-1 font-medium">{event.next}</p>
+                              </div>
+                              <div className="sm:col-span-2">
+                                <p className="text-muted-foreground">Reason</p>
+                                <p className="mt-1 font-medium">{event.reason}</p>
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
       )}
     </>
   );
 }
 
-function CustomersPage({ requests }: { requests: DemoRequest[] }) {
+function CustomersPage() {
+  const customersQuery = useCustomerList();
+  const requestsQuery = useAdminRequests();
+  const customers = customersQuery.data ?? [];
+  const requests = requestsQuery.data ?? [];
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("All statuses");
-  const filtered = requests.filter(
-    (item) =>
-      `${item.customerId} ${item.name} ${item.email}`.toLowerCase().includes(query.toLowerCase()) &&
-      (status === "All statuses" || item.status === status.toUpperCase().replaceAll(" ", "_")),
+  // The backend has no server-side search or pagination for the directory;
+  // filtering and the join with the latest request happen here, client-side.
+  const rows = useMemo(
+    () =>
+      customers.map((customer) => ({
+        customer,
+        request: requests.find((item) => item.customerId === customer.customerId) as
+          KycRequestSummary | undefined,
+      })),
+    [customers, requests],
+  );
+  const filtered = rows.filter(
+    ({ customer }) =>
+      `${customer.customerId} ${customer.name} ${customer.email}`
+        .toLowerCase()
+        .includes(query.toLowerCase()) &&
+      (status === "All statuses" ||
+        customer.kycStatus === status.toUpperCase().replaceAll(" ", "_")),
   );
   const navigate = useNavigate();
   return (
@@ -2207,78 +2647,95 @@ function CustomersPage({ requests }: { requests: DemoRequest[] }) {
         title="Customers"
         description="Customer directory and latest verification status."
       />
-      <div className="mb-4 flex flex-col gap-3 sm:flex-row">
-        <div className="relative flex-1">
-          <Search
-            size={15}
-            className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground"
-          />
-          <Input
-            className="pl-9"
-            placeholder="Search name or customer ID"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            aria-label="Search customers"
-          />
-        </div>
-        <select
-          className="h-9 rounded-md border border-input bg-card px-3 text-sm"
-          value={status}
-          onChange={(event) => setStatus(event.target.value)}
-          aria-label="Filter customers by status"
-        >
-          {["All statuses", "Under review", "Submitted", "Verified", "Rejected"].map((item) => (
-            <option key={item}>{item}</option>
-          ))}
-        </select>
-      </div>
-      {filtered.length === 0 ? (
-        <EmptyState title="No customers found" text="Try another search or status filter." />
+      {customersQuery.isPending && !customersQuery.data ? (
+        <LoadingState label="Loading customers…" />
+      ) : customersQuery.error ? (
+        <ErrorState error={customersQuery.error} onRetry={() => void customersQuery.refetch()} />
       ) : (
-        <div className="overflow-x-auto rounded-lg border border-border bg-card">
-          <table className="w-full min-w-[740px] text-left text-sm">
-            <thead className="border-b border-border bg-background text-[11px] uppercase tracking-wider text-muted-foreground">
-              <tr>
-                {["Customer", "Contact", "Latest request", "KYC status", "Updated", ""].map(
-                  (head) => (
-                    <th className="px-4 py-3 font-medium" key={head}>
-                      {head}
-                    </th>
-                  ),
-                )}
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-border">
-              {filtered.map((item) => (
-                <tr key={item.customerId} className="hover:bg-accent/20">
-                  <td className="px-4 py-4">
-                    <p className="font-semibold">{item.name}</p>
-                    <p className="mt-1 text-xs text-muted-foreground">{item.customerId}</p>
-                  </td>
-                  <td className="px-4 py-4 text-xs text-muted-foreground">
-                    {item.email.replace(/^(.{2}).*(@.*)$/, "$1•••$2")}
-                  </td>
-                  <td className="px-4 py-4 text-xs font-medium">{item.id}</td>
-                  <td className="px-4 py-4">
-                    <StatusBadge status={item.status} />
-                  </td>
-                  <td className="px-4 py-4 text-xs text-muted-foreground">{item.updated}</td>
-                  <td className="px-4 py-4">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() =>
-                        void navigate({ to: "/admin/requests/$id", params: { id: item.id } })
-                      }
-                    >
-                      View details <ArrowRight size={13} />
-                    </Button>
-                  </td>
-                </tr>
+        <>
+          <div className="mb-4 flex flex-col gap-3 sm:flex-row">
+            <div className="relative flex-1">
+              <Search
+                size={15}
+                className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground"
+              />
+              <Input
+                className="pl-9"
+                placeholder="Search name or customer ID"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                aria-label="Search customers"
+              />
+            </div>
+            <select
+              className="h-9 rounded-md border border-input bg-card px-3 text-sm"
+              value={status}
+              onChange={(event) => setStatus(event.target.value)}
+              aria-label="Filter customers by status"
+            >
+              {["All statuses", "Under review", "Submitted", "Verified", "Rejected"].map((item) => (
+                <option key={item}>{item}</option>
               ))}
-            </tbody>
-          </table>
-        </div>
+            </select>
+          </div>
+          {filtered.length === 0 ? (
+            <EmptyState title="No customers found" text="Try another search or status filter." />
+          ) : (
+            <div className="overflow-x-auto rounded-lg border border-border bg-card">
+              <table className="w-full min-w-[740px] text-left text-sm">
+                <thead className="border-b border-border bg-background text-[11px] uppercase tracking-wider text-muted-foreground">
+                  <tr>
+                    {["Customer", "Contact", "Latest request", "KYC status", "Updated", ""].map(
+                      (head) => (
+                        <th className="px-4 py-3 font-medium" key={head}>
+                          {head}
+                        </th>
+                      ),
+                    )}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border">
+                  {filtered.map(({ customer, request }) => (
+                    <tr key={customer.customerId} className="hover:bg-accent/20">
+                      <td className="px-4 py-4">
+                        <p className="font-semibold">{customer.name}</p>
+                        <p className="mt-1 text-xs text-muted-foreground">{customer.customerId}</p>
+                      </td>
+                      <td className="px-4 py-4 text-xs text-muted-foreground">
+                        {maskEmail(customer.email)}
+                      </td>
+                      <td className="px-4 py-4 text-xs font-medium">{request?.id ?? "—"}</td>
+                      <td className="px-4 py-4">
+                        <StatusBadge status={customer.kycStatus} />
+                      </td>
+                      <td className="px-4 py-4 text-xs text-muted-foreground">
+                        {request?.updated ?? "—"}
+                      </td>
+                      <td className="px-4 py-4 text-right">
+                        {request ? (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() =>
+                              void navigate({
+                                to: "/admin/requests/$id",
+                                params: { id: request.id },
+                              })
+                            }
+                          >
+                            View details <ArrowRight size={13} />
+                          </Button>
+                        ) : (
+                          <span className="text-xs text-muted-foreground">No request yet</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
       )}
     </>
   );
@@ -2293,8 +2750,8 @@ function UnauthorizedPage() {
         </span>
         <h1 className="mt-5 text-2xl font-semibold">This workspace is unavailable</h1>
         <p className="mt-2 text-sm leading-6 text-muted-foreground">
-          Sign in with the appropriate demo role to continue. Role checks in this app are simulated
-          and are not production security.
+          Your account does not have permission to view this area. Contact an administrator if you
+          need access.
         </p>
         <Link to="/login">
           <Button className="mt-5">Back to sign in</Button>
@@ -2305,13 +2762,18 @@ function UnauthorizedPage() {
 }
 
 function ProtectedPage({ page, id }: { page: PageKey; id?: string | undefined }) {
-  const { role, ready, requests } = useDemo();
+  const { role, ready } = useDemo();
+  const navigate = useNavigate();
   const expected =
     page.startsWith("admin") || ["requests", "request-detail", "audit", "customers"].includes(page)
       ? "admin"
       : "customer";
-  // Wait until the stored demo role is restored before deciding access.
+  // Wait until the stored session is restored before deciding access.
+  useEffect(() => {
+    if (ready && !role) void navigate({ to: "/login" });
+  }, [navigate, ready, role]);
   if (!ready) return null;
+  if (!role) return null;
   if (role !== expected) return <UnauthorizedPage />;
   let content: ReactNode;
   if (page === "customer-dashboard") content = <CustomerDashboard />;
@@ -2319,11 +2781,11 @@ function ProtectedPage({ page, id }: { page: PageKey; id?: string | undefined })
   else if (page === "submit") content = <SubmitPage />;
   else if (page === "status") content = <StatusPage />;
   else if (page === "customer-profile") content = <ProfilePage />;
-  else if (page === "admin-dashboard") content = <AdminDashboard requests={requests} />;
-  else if (page === "requests") content = <RequestsPage requests={requests} />;
+  else if (page === "admin-dashboard") content = <AdminDashboard />;
+  else if (page === "requests") content = <RequestsPage />;
   else if (page === "request-detail") content = <RequestDetail id={id ?? ""} />;
   else if (page === "audit") content = <AuditPage />;
-  else if (page === "customers") content = <CustomersPage requests={requests} />;
+  else if (page === "customers") content = <CustomersPage />;
   else content = <ProfilePage admin />;
   return <AppShell area={expected}>{content}</AppShell>;
 }

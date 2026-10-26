@@ -1,23 +1,34 @@
-import time
-from fastapi import APIRouter, HTTPException, Depends
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from app.database import get_db
-from app.models.kyc import Customer, KycRequest, Document
+from app.models.kyc import Customer, KycRequest, Document, User
 from app.schemas.kyc import SubmitDocumentsRequest
+from app.security import get_current_user
 
 router = APIRouter(prefix="/documents", tags=["Documents"])
 
 
 @router.post("/submit")
-def submit_documents(payload: SubmitDocumentsRequest, db: Session = Depends(get_db)):
+def submit_documents(
+    payload: SubmitDocumentsRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """
     Simulates document upload and KYC submission.
     Creates or updates the customer KYC request in PostgreSQL.
     """
-    customer_id = payload.customerId or "CUS-1042"
-    customer = db.query(Customer).filter(Customer.customer_id == customer_id).first()
+    if user.role != "customer":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Customer access required.")
+    customer = db.query(Customer).filter(Customer.user_id == user.id).first()
+    if customer is None:
+        customer = db.query(Customer).filter(Customer.customer_id == user.user_id).first()
     if not customer:
         raise HTTPException(status_code=404, detail="Customer not found")
+    customer_id = customer.customer_id
 
     files = payload.files if payload.files else ["Aadhaar", "Voter ID"]
 
@@ -31,8 +42,13 @@ def submit_documents(payload: SubmitDocumentsRequest, db: Session = Depends(get_
         )
         db.add(doc)
 
-    today = "12 Oct 2026"
-    existing_req = db.query(KycRequest).filter(KycRequest.customer_id == customer_id).first()
+    today = datetime.now(timezone.utc).strftime("%d %b %Y")
+    existing_req = (
+        db.query(KycRequest)
+        .filter(KycRequest.customer_id == customer_id)
+        .order_by(KycRequest.id.desc())
+        .first()
+    )
 
     if existing_req:
         existing_req.status = "SUBMITTED"
@@ -44,7 +60,7 @@ def submit_documents(payload: SubmitDocumentsRequest, db: Session = Depends(get_
         db.commit()
         return {"requestId": existing_req.request_id, "status": "SUBMITTED", "message": "KYC documents submitted successfully."}
 
-    new_id = f"KYC-{str(int(time.time()))[-4:]}"
+    new_id = f"KYC-{uuid4().hex[:12].upper()}"
     new_req = KycRequest(
         request_id=new_id,
         customer_id=customer_id,

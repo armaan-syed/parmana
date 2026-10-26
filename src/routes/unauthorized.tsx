@@ -5,11 +5,14 @@ export const Route = createFileRoute("/unauthorized")({
   head: () => ({
     meta: [
       { title: "Workspace unavailable — Pramāṇa" },
-      { name: "description", content: "Sign in with the appropriate demo role to continue." },
+      {
+        name: "description",
+        content: "Your account does not have permission to view this workspace.",
+      },
       { property: "og:title", content: "Workspace unavailable — Pramāṇa" },
       {
         property: "og:description",
-        content: "Sign in with the appropriate demo role to continue.",
+        content: "Your account does not have permission to view this workspace.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary" },

@@ -1,8 +1,12 @@
 from typing import List
-from fastapi import APIRouter, HTTPException, Depends
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.database import get_db
-from app.models.kyc import Customer, KycRequest, AuditLog
+from app.models.kyc import Customer, KycRequest, AuditLog, User
+from app.security import require_admin
 from app.schemas.kyc import (
     KycRequestResponse,
     AuditEventResponse,
@@ -11,7 +15,19 @@ from app.schemas.kyc import (
     RejectRequest,
 )
 
-router = APIRouter(prefix="/admin", tags=["Admin & Verification Workflow"])
+router = APIRouter(
+    prefix="/admin",
+    tags=["Admin & Verification Workflow"],
+    dependencies=[Depends(require_admin)],
+)
+
+
+def _current_date() -> str:
+    return datetime.now(timezone.utc).strftime("%d %b %Y")
+
+
+def _current_timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%d %b %Y · %H:%M UTC")
 
 
 @router.get("/requests", response_model=List[KycRequestResponse])
@@ -19,7 +35,10 @@ def get_all_requests(db: Session = Depends(get_db)):
     """
     Returns list of all KYC requests in the queue for administrator review.
     """
-    requests = db.query(KycRequest).order_by(KycRequest.id.asc()).all()
+    # New submissions and resubmissions must be immediately visible to a
+    # reviewer.  The UI's first page is the active review queue, so return the
+    # newest stored request first instead of burying it behind older records.
+    requests = db.query(KycRequest).order_by(KycRequest.id.desc()).all()
     results = []
     for req in requests:
         customer = db.query(Customer).filter(Customer.customer_id == req.customer_id).first()
@@ -65,7 +84,12 @@ def get_request_by_id(request_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/requests/{request_id}/process")
-def process_request(request_id: str, payload: ProcessRequest = None, db: Session = Depends(get_db)):
+def process_request(
+    request_id: str,
+    payload: ProcessRequest = None,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
     """
     Approves and verifies a clean matching KYC case.
     """
@@ -81,10 +105,10 @@ def process_request(request_id: str, payload: ProcessRequest = None, db: Session
             detail="Cannot directly process: request has mismatched or uncertain fields. Use Update & Process instead.",
         )
 
-    admin_name = payload.adminName if payload and payload.adminName else "Nisha Verma"
+    admin_name = current_admin.full_name
     previous_status = req.status
     req.status = "VERIFIED"
-    req.updated_at = "12 Oct 2026"
+    req.updated_at = _current_date()
 
     customer = db.query(Customer).filter(Customer.customer_id == req.customer_id).first()
     if customer:
@@ -92,7 +116,7 @@ def process_request(request_id: str, payload: ProcessRequest = None, db: Session
 
     # Insert immutable audit entry
     audit = AuditLog(
-        audit_id=f"AUD-{str(req.id).zfill(4)}",
+        audit_id=f"AUD-{uuid4().hex[:12].upper()}",
         request_id=req.request_id,
         customer_id=req.customer_id,
         customer_name=customer.name if customer else "Customer",
@@ -102,7 +126,7 @@ def process_request(request_id: str, payload: ProcessRequest = None, db: Session
         previous_value=previous_status.replace("_", " ").title(),
         next_value="Verified",
         reason="All required fields reviewed and matched.",
-        timestamp="12 Oct 2026 · 15:00",
+        timestamp=_current_timestamp(),
     )
     db.add(audit)
     db.commit()
@@ -111,7 +135,12 @@ def process_request(request_id: str, payload: ProcessRequest = None, db: Session
 
 
 @router.post("/requests/{request_id}/update-and-process")
-def update_and_process_request(request_id: str, payload: UpdateAndProcessRequest, db: Session = Depends(get_db)):
+def update_and_process_request(
+    request_id: str,
+    payload: UpdateAndProcessRequest,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
     """
     Updates an outdated customer field based on valid document evidence and verifies the request.
     Creates an immutable audit log of the change.
@@ -127,7 +156,7 @@ def update_and_process_request(request_id: str, payload: UpdateAndProcessRequest
     field_name = payload.field
     new_value = payload.value
     reason = payload.reason
-    admin_name = payload.adminName or "Nisha Verma"
+    admin_name = current_admin.full_name
 
     # Find the target field in comparison fields
     fields = list(req.fields_data or [])
@@ -157,13 +186,12 @@ def update_and_process_request(request_id: str, payload: UpdateAndProcessRequest
     all_matched = all(f.get("result") == "MATCH" for f in fields)
     req.fields_data = fields
     req.status = "VERIFIED" if all_matched else "UNDER_REVIEW"
-    req.updated_at = "12 Oct 2026"
-    if all_matched:
-        customer.kyc_status = "VERIFIED"
+    req.updated_at = _current_date()
+    customer.kyc_status = req.status
 
     # Insert immutable audit record
     audit = AuditLog(
-        audit_id=f"AUD-{str(int(time.time() * 1000))[-5:]}" if "time" in locals() else f"AUD-{req.request_id[-4:]}",
+        audit_id=f"AUD-{uuid4().hex[:12].upper()}",
         request_id=req.request_id,
         customer_id=req.customer_id,
         customer_name=customer.name,
@@ -173,7 +201,7 @@ def update_and_process_request(request_id: str, payload: UpdateAndProcessRequest
         previous_value=previous_val,
         next_value=new_value,
         reason=reason,
-        timestamp="12 Oct 2026 · 15:30",
+        timestamp=_current_timestamp(),
     )
     db.add(audit)
     db.commit()
@@ -186,7 +214,12 @@ def update_and_process_request(request_id: str, payload: UpdateAndProcessRequest
 
 
 @router.post("/requests/{request_id}/reject")
-def reject_request(request_id: str, payload: RejectRequest, db: Session = Depends(get_db)):
+def reject_request(
+    request_id: str,
+    payload: RejectRequest,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
     """
     Rejects a KYC request with a mandatory reason.
     """
@@ -195,17 +228,17 @@ def reject_request(request_id: str, payload: RejectRequest, db: Session = Depend
         raise HTTPException(status_code=404, detail="Request not found.")
 
     customer = db.query(Customer).filter(Customer.customer_id == req.customer_id).first()
-    admin_name = payload.adminName or "Nisha Verma"
+    admin_name = current_admin.full_name
     prev_status = req.status
 
     req.status = "REJECTED"
     req.reason = payload.reason
-    req.updated_at = "12 Oct 2026"
+    req.updated_at = _current_date()
     if customer:
         customer.kyc_status = "REJECTED"
 
     audit = AuditLog(
-        audit_id=f"AUD-{req.request_id[-4:]}R",
+        audit_id=f"AUD-{uuid4().hex[:12].upper()}",
         request_id=req.request_id,
         customer_id=req.customer_id,
         customer_name=customer.name if customer else "Customer",
@@ -215,7 +248,7 @@ def reject_request(request_id: str, payload: RejectRequest, db: Session = Depend
         previous_value=prev_status.replace("_", " ").title(),
         next_value="Rejected",
         reason=payload.reason,
-        timestamp="12 Oct 2026 · 16:00",
+        timestamp=_current_timestamp(),
     )
     db.add(audit)
     db.commit()
